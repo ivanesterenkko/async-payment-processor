@@ -1,0 +1,132 @@
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: payments
+      POSTGRES_PASSWORD: payment
+      POSTGRES_USER: payment
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U payment -d payments"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+
+  rabbitmq:
+    image: rabbitmq:4.0-management
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "check_running"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    volumes:
+      - rabbitmq_data:/var/lib/rabbitmq
+
+  api:
+    build: .
+    restart: unless-stopped
+    command:
+      - /bin/sh
+      - -c
+      - alembic upgrade head && uvicorn app.main:create_app --factory --host 0.0.0.0 --port 8000
+    depends_on:
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8000:8000"
+
+  consumer:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.messaging.consumer"]
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-m",
+          "app.tools.healthcheck",
+          "--file",
+          "/tmp/consumer-heartbeat",
+          "--max-age-seconds",
+          "30",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  outbox-relay:
+    build: .
+    restart: unless-stopped
+    command: ["python", "-m", "app.messaging.outbox_relay"]
+    depends_on:
+      api:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    env_file:
+      - .env
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "python",
+          "-m",
+          "app.tools.healthcheck",
+          "--file",
+          "/tmp/outbox-relay-heartbeat",
+          "--max-age-seconds",
+          "30",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  webhook-mock:
+    build: .
+    restart: unless-stopped
+    command:
+      - uvicorn
+      - app.tools.webhook_mock:create_app
+      - --factory
+      - --host
+      - 0.0.0.0
+      - --port
+      - "8080"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8080/health"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "8081:8080"
+
+volumes:
+  postgres_data:
+  rabbitmq_data:
