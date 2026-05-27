@@ -37,6 +37,7 @@ async def main() -> None:
                         session=session,
                         publisher=publisher,
                         batch_size=settings.outbox_batch_size,
+                        claim_timeout_seconds=settings.outbox_claim_timeout_seconds,
                     )
                     published_count = await relay.publish_pending_events()
             except asyncio.CancelledError:

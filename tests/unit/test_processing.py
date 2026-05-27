@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from datetime import timedelta
 from decimal import Decimal
 from uuid import uuid4
 
-import pytest
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -93,6 +93,7 @@ async def create_payment(
     now = utcnow()
     payment = Payment(
         id=uuid4(),
+        event_id=uuid4(),
         amount=Decimal("15.00"),
         currency=Currency.USD,
         description="Webhook processing",
@@ -125,6 +126,7 @@ def build_processor(
         gateway=gateway,
         webhook_sender=webhook_sender,  # type: ignore[arg-type]
         max_delivery_attempts=3,
+        processing_retry_routing_key="payments.processing.retry",
         retry_routing_keys=RETRY_ROUTING_KEYS,
         dlq_routing_key="payments.dlq",
         gateway_claim_timeout_seconds=30.0,
@@ -344,12 +346,160 @@ async def test_gateway_failure_clears_claim_and_records_error(
             gateway=ExplodingGateway(),
             webhook_sender=RecordingWebhookSender(),
         )
-        with pytest.raises(RuntimeError, match="gateway unavailable"):
-            await processor.process(event)
+        await processor.process(event)
         refreshed = await session.get(Payment, payment.id)
+        outbox_events = list((await session.execute(select(OutboxEvent))).scalars())
 
     assert refreshed is not None
     assert refreshed.status == PaymentStatus.PENDING
     assert refreshed.gateway_claimed_at is None
     assert refreshed.processed_at is None
     assert refreshed.last_error == "Gateway processing failed: gateway unavailable"
+    assert outbox_events[0].routing_key == "payments.processing.retry"
+
+
+async def test_stale_gateway_result_cannot_finalize_newer_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        payment = await create_payment(session)
+        event = PaymentCreatedEvent(
+            event_id=payment.event_id,
+            payment_id=payment.id,
+            idempotency_key=payment.idempotency_key,
+            created_at=payment.created_at,
+            webhook_attempt=0,
+        )
+        processor = build_processor(
+            session,
+            gateway=StaticGateway(PaymentStatus.SUCCEEDED),
+            webhook_sender=RecordingWebhookSender(),
+        )
+        claimed_at = await processor._claim_gateway(payment.id)
+        assert claimed_at is not None
+        payment.gateway_claimed_at = claimed_at + timedelta(seconds=1)
+        await session.commit()
+
+        await processor._finalize_gateway(event, claimed_at, PaymentStatus.SUCCEEDED)
+        await session.refresh(payment)
+
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.gateway_claimed_at is not None
+    assert payment.processed_at is None
+
+
+async def test_stale_gateway_failure_cannot_schedule_retry_for_newer_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        payment = await create_payment(session)
+        event = PaymentCreatedEvent(
+            event_id=payment.event_id,
+            payment_id=payment.id,
+            idempotency_key=payment.idempotency_key,
+            created_at=payment.created_at,
+            webhook_attempt=0,
+        )
+        processor = build_processor(
+            session,
+            gateway=ExplodingGateway(),
+            webhook_sender=RecordingWebhookSender(),
+        )
+        claimed_at = await processor._claim_gateway(payment.id)
+        assert claimed_at is not None
+        payment.gateway_claimed_at = claimed_at + timedelta(seconds=1)
+        await session.commit()
+
+        await processor._record_gateway_failure(
+            event,
+            claimed_at,
+            RuntimeError("late failure"),
+        )
+        await session.refresh(payment)
+        outbox_events = list((await session.execute(select(OutboxEvent))).scalars())
+
+    assert payment.status == PaymentStatus.PENDING
+    assert payment.gateway_claimed_at is not None
+    assert payment.last_error is None
+    assert outbox_events == []
+
+
+async def test_stale_webhook_success_cannot_complete_newer_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        payment = await create_payment(
+            session,
+            status=PaymentStatus.SUCCEEDED,
+            processed=True,
+        )
+        event = PaymentCreatedEvent(
+            event_id=payment.event_id,
+            payment_id=payment.id,
+            idempotency_key=payment.idempotency_key,
+            created_at=payment.created_at,
+            webhook_attempt=0,
+        )
+        processor = build_processor(
+            session,
+            gateway=StaticGateway(PaymentStatus.SUCCEEDED),
+            webhook_sender=RecordingWebhookSender(),
+        )
+        claimed_at = await processor._claim_webhook(payment, event)
+        assert claimed_at is not None
+        payment.webhook_claimed_at = claimed_at + timedelta(seconds=1)
+        await session.commit()
+
+        await processor._record_webhook_success(
+            payment=payment,
+            event=event,
+            claimed_at=claimed_at,
+            attempt_number=1,
+        )
+        await session.refresh(payment)
+
+    assert payment.webhook_claimed_at is not None
+    assert payment.webhook_delivered_at is None
+    assert payment.webhook_attempts == 0
+
+
+async def test_stale_webhook_failure_cannot_schedule_retry_for_newer_claim(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    async with session_factory() as session:
+        payment = await create_payment(
+            session,
+            status=PaymentStatus.SUCCEEDED,
+            processed=True,
+        )
+        event = PaymentCreatedEvent(
+            event_id=payment.event_id,
+            payment_id=payment.id,
+            idempotency_key=payment.idempotency_key,
+            created_at=payment.created_at,
+            webhook_attempt=0,
+        )
+        processor = build_processor(
+            session,
+            gateway=StaticGateway(PaymentStatus.SUCCEEDED),
+            webhook_sender=FailingWebhookSender(),
+        )
+        claimed_at = await processor._claim_webhook(payment, event)
+        assert claimed_at is not None
+        payment.webhook_claimed_at = claimed_at + timedelta(seconds=1)
+        await session.commit()
+
+        await processor._record_webhook_failure(
+            payment=payment,
+            event=event,
+            claimed_at=claimed_at,
+            attempt_number=1,
+            error=WebhookDeliveryError("late failure", retryable=True),
+        )
+        await session.refresh(payment)
+        outbox_events = list((await session.execute(select(OutboxEvent))).scalars())
+
+    assert payment.webhook_claimed_at is not None
+    assert payment.webhook_attempts == 0
+    assert payment.last_error is None
+    assert outbox_events == []

@@ -20,6 +20,7 @@ class Settings(BaseSettings):
     rabbitmq_url: str = "amqp://guest:guest@localhost:5672/"
     rabbitmq_exchange: str = "payments"
     rabbitmq_main_queue: str = "payments.new"
+    rabbitmq_processing_retry_queue: str = "payments.processing.retry"
     rabbitmq_retry_queues: tuple[str, ...] = (
         "payments.new.retry.1",
         "payments.new.retry.2",
@@ -27,11 +28,16 @@ class Settings(BaseSettings):
     rabbitmq_dlq: str = "payments.dlq"
     outbox_batch_size: int = 50
     outbox_poll_interval_seconds: float = 1.0
+    outbox_claim_timeout_seconds: float = 30.0
+    processing_retry_delay_seconds: int = 2
     webhook_timeout_seconds: float = 5.0
     webhook_max_delivery_attempts: int = 3
     webhook_retry_delays_seconds: tuple[int, ...] = Field(default=(2, 4))
+    webhook_allowed_hosts: tuple[str, ...] = ()
     gateway_claim_timeout_seconds: float = 30.0
     webhook_claim_timeout_seconds: float = 30.0
+    claim_recovery_batch_size: int = 50
+    claim_recovery_poll_interval_seconds: float = 1.0
     worker_heartbeat_file_consumer: str = "/tmp/consumer-heartbeat"
     worker_heartbeat_file_outbox_relay: str = "/tmp/outbox-relay-heartbeat"
     worker_heartbeat_interval_seconds: float = 5.0
@@ -65,6 +71,19 @@ class Settings(BaseSettings):
             return cast(tuple[int, ...], tuple(value))
 
         return tuple(int(item.strip()) for item in value.split(",") if item.strip())
+
+    @field_validator("webhook_allowed_hosts", mode="before")
+    @classmethod
+    def parse_allowed_hosts(
+        cls,
+        value: str | list[str] | tuple[str, ...],
+    ) -> tuple[str, ...]:
+        if isinstance(value, tuple):
+            return value
+        if isinstance(value, list):
+            return tuple(host.lower() for host in value)
+
+        return tuple(host.strip().lower() for host in value.split(",") if host.strip())
 
     @field_validator("payment_gateway_success_rate")
     @classmethod
@@ -103,6 +122,22 @@ class Settings(BaseSettings):
             )
         if any(delay <= 0 for delay in self.webhook_retry_delays_seconds):
             raise ValueError("WEBHOOK_RETRY_DELAYS_SECONDS values must be positive.")
+        if self.processing_retry_delay_seconds <= 0:
+            raise ValueError("PROCESSING_RETRY_DELAY_SECONDS must be positive.")
+        if self.outbox_claim_timeout_seconds <= 0:
+            raise ValueError("OUTBOX_CLAIM_TIMEOUT_SECONDS must be positive.")
+        if self.claim_recovery_poll_interval_seconds <= 0:
+            raise ValueError("CLAIM_RECOVERY_POLL_INTERVAL_SECONDS must be positive.")
+        if self.claim_recovery_batch_size < 1:
+            raise ValueError("CLAIM_RECOVERY_BATCH_SIZE must be at least 1.")
+        if self.gateway_claim_timeout_seconds <= self.payment_gateway_max_delay_seconds:
+            raise ValueError(
+                "GATEWAY_CLAIM_TIMEOUT_SECONDS must exceed PAYMENT_GATEWAY_MAX_DELAY_SECONDS."
+            )
+        if self.webhook_claim_timeout_seconds <= self.webhook_timeout_seconds:
+            raise ValueError(
+                "WEBHOOK_CLAIM_TIMEOUT_SECONDS must exceed WEBHOOK_TIMEOUT_SECONDS."
+            )
         return self
 
 

@@ -76,8 +76,10 @@ class PaymentService:
 
         created_at = utcnow()
         payment_id = uuid.uuid4()
+        event_id = uuid.uuid4()
         payment = Payment(
             id=payment_id,
+            event_id=event_id,
             amount=payload.amount,
             currency=payload.currency,
             description=payload.description,
@@ -91,7 +93,7 @@ class PaymentService:
         )
 
         event = PaymentCreatedEvent(
-            event_id=uuid.uuid4(),
+            event_id=event_id,
             payment_id=payment_id,
             idempotency_key=idempotency_key,
             created_at=created_at,

@@ -34,6 +34,7 @@ class Payment(Base):
     )
 
     id: Mapped[uuid.UUID] = mapped_column(sa.Uuid(), primary_key=True, default=uuid.uuid4)
+    event_id: Mapped[uuid.UUID] = mapped_column(sa.Uuid(), nullable=False, unique=True)
     amount: Mapped[Decimal] = mapped_column(sa.Numeric(18, 2), nullable=False)
     currency: Mapped[Currency] = mapped_column(
         sa.Enum(
@@ -97,6 +98,7 @@ class OutboxEvent(Base):
     payload: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False)
     headers: Mapped[dict[str, Any]] = mapped_column(JSON_TYPE, nullable=False, default=dict)
     attempts: Mapped[int] = mapped_column(sa.Integer, nullable=False, default=0)
+    claimed_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     published_at: Mapped[datetime | None] = mapped_column(sa.DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(sa.Text())
     created_at: Mapped[datetime] = mapped_column(

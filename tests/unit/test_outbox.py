@@ -51,7 +51,12 @@ async def test_outbox_relay_publishes_and_marks_events(
 
     publisher = RecordingPublisher()
     async with session_factory() as session:
-        relay = OutboxRelayService(session=session, publisher=publisher, batch_size=10)
+        relay = OutboxRelayService(
+            session=session,
+            publisher=publisher,
+            batch_size=10,
+            claim_timeout_seconds=30.0,
+        )
         published_count = await relay.publish_pending_events()
 
     assert published_count == 1
@@ -85,14 +90,19 @@ async def test_outbox_duplicate_publish_after_commit_failure_is_safe(
 
     publisher = RecordingPublisher()
     async with session_factory() as session:
-        relay = OutboxRelayService(session=session, publisher=publisher, batch_size=10)
+        relay = OutboxRelayService(
+            session=session,
+            publisher=publisher,
+            batch_size=10,
+            claim_timeout_seconds=0.0,
+        )
         original_commit = session.commit
         commit_attempts = 0
 
         async def failing_commit() -> None:
             nonlocal commit_attempts
             commit_attempts += 1
-            if commit_attempts == 1:
+            if commit_attempts == 2:
                 raise RuntimeError("commit failed after publish")
             await original_commit()
 
@@ -101,7 +111,12 @@ async def test_outbox_duplicate_publish_after_commit_failure_is_safe(
             await relay.publish_pending_events()
 
     async with session_factory() as session:
-        relay = OutboxRelayService(session=session, publisher=publisher, batch_size=10)
+        relay = OutboxRelayService(
+            session=session,
+            publisher=publisher,
+            batch_size=10,
+            claim_timeout_seconds=0.0,
+        )
         published_count = await relay.publish_pending_events()
 
     assert published_count == 1

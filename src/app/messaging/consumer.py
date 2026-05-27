@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import logging
 
-from faststream import FastStream
+from faststream import AckPolicy, FastStream
 from faststream.rabbit import RabbitBroker
 
 from app.application.gateway import SimulatedPaymentGateway
 from app.application.processing import PaymentEventProcessor
+from app.application.recovery import ClaimRecoveryService
 from app.application.webhooks import HttpWebhookSender
 from app.core.config import get_settings
 from app.core.heartbeat import Heartbeat
@@ -29,17 +31,62 @@ gateway = SimulatedPaymentGateway(
     max_delay_seconds=settings.payment_gateway_max_delay_seconds,
     success_rate=settings.payment_gateway_success_rate,
 )
-webhook_sender = HttpWebhookSender(timeout_seconds=settings.webhook_timeout_seconds)
+webhook_sender = HttpWebhookSender(
+    timeout_seconds=settings.webhook_timeout_seconds,
+    allowed_hosts=frozenset(settings.webhook_allowed_hosts),
+)
 heartbeat = Heartbeat(settings.worker_heartbeat_file_consumer)
+recovery_task: asyncio.Task[None] | None = None
 
 
 @app.after_startup
 async def bootstrap_topology() -> None:
+    global recovery_task
     await declare_topology(broker, topology)
     await heartbeat.start(interval_seconds=settings.worker_heartbeat_interval_seconds)
+    recovery_task = asyncio.create_task(run_claim_recovery(), name="claim-recovery")
 
 
-@broker.subscriber(queue=topology.main_queue, exchange=topology.exchange)
+@app.on_shutdown
+async def stop_claim_recovery() -> None:
+    global recovery_task
+    if recovery_task is None:
+        return
+    recovery_task.cancel()
+    with contextlib.suppress(asyncio.CancelledError):
+        await recovery_task
+    recovery_task = None
+
+
+async def run_claim_recovery() -> None:
+    while True:
+        try:
+            async with session_factory() as session:
+                recovery = ClaimRecoveryService(
+                    session=session,
+                    main_routing_key=topology.main_queue.name,
+                    batch_size=settings.claim_recovery_batch_size,
+                    gateway_claim_timeout_seconds=settings.gateway_claim_timeout_seconds,
+                    webhook_claim_timeout_seconds=settings.webhook_claim_timeout_seconds,
+                )
+                recovered_count = await recovery.recover_stale_claims()
+            if recovered_count:
+                logger.warning(
+                    "Expired processing claims recovered.",
+                    extra=log_context(recovered_count=recovered_count),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Claim recovery iteration failed.")
+        await asyncio.sleep(settings.claim_recovery_poll_interval_seconds)
+
+
+@broker.subscriber(
+    queue=topology.main_queue,
+    exchange=topology.exchange,
+    ack_policy=AckPolicy.NACK_ON_ERROR,
+)
 async def handle_payment_created(event: PaymentCreatedEvent) -> None:
     await heartbeat.beat()
     logger.info(
@@ -57,6 +104,7 @@ async def handle_payment_created(event: PaymentCreatedEvent) -> None:
             gateway=gateway,
             webhook_sender=webhook_sender,
             max_delivery_attempts=settings.webhook_max_delivery_attempts,
+            processing_retry_routing_key=topology.processing_retry_queue.name,
             retry_routing_keys=tuple(queue.name for queue in topology.retry_queues),
             dlq_routing_key=topology.dlq_queue.name,
             gateway_claim_timeout_seconds=settings.gateway_claim_timeout_seconds,

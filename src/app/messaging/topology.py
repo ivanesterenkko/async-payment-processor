@@ -11,11 +11,12 @@ from app.core.config import Settings
 class RabbitTopology:
     exchange: RabbitExchange
     main_queue: RabbitQueue
+    processing_retry_queue: RabbitQueue
     retry_queues: tuple[RabbitQueue, ...]
     dlq_queue: RabbitQueue
 
     def all_queues(self) -> tuple[RabbitQueue, ...]:
-        return (self.main_queue, *self.retry_queues, self.dlq_queue)
+        return (self.main_queue, self.processing_retry_queue, *self.retry_queues, self.dlq_queue)
 
 
 def build_rabbit_topology(settings: Settings) -> RabbitTopology:
@@ -28,6 +29,16 @@ def build_rabbit_topology(settings: Settings) -> RabbitTopology:
         name=settings.rabbitmq_main_queue,
         durable=True,
         routing_key=settings.rabbitmq_main_queue,
+    )
+    processing_retry_queue = RabbitQueue(
+        name=settings.rabbitmq_processing_retry_queue,
+        durable=True,
+        routing_key=settings.rabbitmq_processing_retry_queue,
+        arguments={
+            "x-message-ttl": settings.processing_retry_delay_seconds * 1000,
+            "x-dead-letter-exchange": settings.rabbitmq_exchange,
+            "x-dead-letter-routing-key": settings.rabbitmq_main_queue,
+        },
     )
     retry_queues = tuple(
         RabbitQueue(
@@ -54,6 +65,7 @@ def build_rabbit_topology(settings: Settings) -> RabbitTopology:
     return RabbitTopology(
         exchange=exchange,
         main_queue=main_queue,
+        processing_retry_queue=processing_retry_queue,
         retry_queues=retry_queues,
         dlq_queue=dlq_queue,
     )

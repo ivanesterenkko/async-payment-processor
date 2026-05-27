@@ -142,3 +142,39 @@ async def test_parallel_identical_idempotency_key_creates_single_payment(
     assert len(payment_ids) == 1
     assert len(payments) == 1
     assert len(outbox_rows) == 1
+
+
+async def test_get_payment_requires_api_key(api_client: AsyncClient) -> None:
+    response = await api_client.get("/api/v1/payments/1082934a-26cf-44d1-9063-a893fc1d905d")
+
+    assert response.status_code == 401
+    assert response.json()["error"]["code"] == "unauthorized"
+
+
+async def test_request_rejects_invalid_amount_and_currency(api_client: AsyncClient) -> None:
+    payload = build_payload()
+    payload["amount"] = "10.999"
+    payload["currency"] = "BTC"
+
+    response = await api_client.post(
+        "/api/v1/payments",
+        json=payload,
+        headers=build_headers("payment-invalid-body"),
+    )
+
+    assert response.status_code == 422
+    assert response.json()["error"]["code"] == "validation_error"
+
+
+async def test_request_rejects_private_ip_webhook_url(api_client: AsyncClient) -> None:
+    payload = build_payload()
+    payload["webhook_url"] = "http://169.254.169.254/latest/meta-data/"
+
+    response = await api_client.post(
+        "/api/v1/payments",
+        json=payload,
+        headers=build_headers("payment-unsafe-webhook"),
+    )
+
+    assert response.status_code == 400
+    assert response.json()["error"]["code"] == "unsafe_webhook_url"
