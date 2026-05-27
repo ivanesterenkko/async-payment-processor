@@ -11,6 +11,7 @@ Runtime processes:
 - `api` exposes HTTP endpoints.
 - `outbox-relay` publishes unpublished outbox rows to RabbitMQ.
 - `consumer` processes payment events and schedules retry or DLQ messages through the outbox.
+- `consumer` also recovers expired processing claims by scheduling durable resume events.
 - `webhook-mock` is an auxiliary service used for reproducible demos and e2e tests.
 
 ## HTTP API
@@ -75,14 +76,15 @@ All handled application errors use a single envelope:
 Two tables are used:
 
 - `payments`
-  - Business state, idempotency key, gateway claim state, webhook claim state, timestamps, and webhook delivery state.
+  - Business state, stable event ID, idempotency key, claim state, timestamps, and webhook delivery state.
 - `outbox`
-  - Serialized broker messages, routing key, publish attempts, and publication status.
+  - Serialized broker messages, routing key, publish lease, attempts, and publication status.
 
 ### Messaging
 
 - Exchange: `payments`
 - Main queue: `payments.new`
+- Processing retry queue: `payments.processing.retry`
 - Retry queues:
   - `payments.new.retry.1`
   - `payments.new.retry.2`
@@ -94,14 +96,18 @@ Retry queues use TTL plus dead-letter routing back into `payments.new`.
 
 - Payment creation and primary event creation happen in one database transaction.
 - Retry and DLQ scheduling also happen through the outbox, not by direct publish from the consumer.
+- Expired gateway or webhook claims are resumed by durable outbox events.
 - If a broker publish succeeds but the relay transaction commit fails, the event may be published again later. The consumer is implemented to tolerate duplicate events.
+- Webhook delivery is `at-least-once`. Receivers must deduplicate by the stable `event_id`, because an HTTP `2xx` response can be observed before the consumer records success.
 
 ### Concurrency model
 
 - The consumer no longer keeps a database transaction open during gateway sleep or during webhook HTTP calls.
 - Gateway work is guarded by a short-lived database claim.
 - Webhook delivery is also guarded by a short-lived database claim.
-- Claim timeouts allow another worker to recover a stuck payment if a worker crashes after claiming work.
+- A recovery loop atomically releases expired claims and writes a resume event to the outbox.
+- Unexpected consumer failures are nacked for broker redelivery; handled gateway failures are retried through `payments.processing.retry`.
+- The included gateway is a simulator. A real acquiring integration must pass a stable provider idempotency key to prevent repeated external charges after an ambiguous timeout or worker crash.
 
 ### Webhook retry policy
 
@@ -115,7 +121,8 @@ Retry queues use TTL plus dead-letter routing back into `payments.new`.
 ### Security hardening
 
 - `Idempotency-Key` must match a strict format and length policy.
-- Webhook URLs are validated against obvious SSRF targets such as localhost, private IP literals, and local/internal hostnames.
+- Webhook delivery rejects local/private/reserved resolved addresses and connects to a validated pinned IP while preserving the original HTTPS SNI and `Host` header.
+- `WEBHOOK_ALLOWED_HOSTS` is an explicit development-only escape hatch used by Docker Compose for `webhook-mock`; it must be empty in production.
 
 ## Local setup
 
@@ -173,11 +180,16 @@ uvicorn app.tools.webhook_mock:create_app --factory --reload --port 8081
 | `RABBITMQ_URL` | RabbitMQ connection URL | `amqp://guest:guest@rabbitmq:5672/` |
 | `OUTBOX_BATCH_SIZE` | Max outbox rows per relay iteration | `50` |
 | `OUTBOX_POLL_INTERVAL_SECONDS` | Relay sleep when nothing was published | `1.0` |
-| `WEBHOOK_TIMEOUT_SECONDS` | HTTP timeout for webhook delivery | `5.0` |
+| `OUTBOX_CLAIM_TIMEOUT_SECONDS` | Publish lease timeout used for relay crash recovery | `30.0` |
+| `PROCESSING_RETRY_DELAY_SECONDS` | Delay for transient gateway-processing retries | `2` |
+| `WEBHOOK_TIMEOUT_SECONDS` | Total DNS resolution and HTTP delivery timeout | `5.0` |
 | `WEBHOOK_MAX_DELIVERY_ATTEMPTS` | Total webhook delivery attempts before DLQ | `3` |
 | `WEBHOOK_RETRY_DELAYS_SECONDS` | Retry delays in seconds | `[2,4]` |
+| `WEBHOOK_ALLOWED_HOSTS` | Development-only webhook host allowlist | `[]` |
 | `GATEWAY_CLAIM_TIMEOUT_SECONDS` | Claim timeout for gateway processing | `30.0` |
 | `WEBHOOK_CLAIM_TIMEOUT_SECONDS` | Claim timeout for webhook delivery | `30.0` |
+| `CLAIM_RECOVERY_BATCH_SIZE` | Max expired claims rescheduled in one iteration | `50` |
+| `CLAIM_RECOVERY_POLL_INTERVAL_SECONDS` | Expired-claim polling interval | `1.0` |
 | `WORKER_HEARTBEAT_INTERVAL_SECONDS` | Health heartbeat interval for workers | `5.0` |
 | `PAYMENT_GATEWAY_MIN_DELAY_SECONDS` | Gateway simulation lower bound | `2.0` |
 | `PAYMENT_GATEWAY_MAX_DELAY_SECONDS` | Gateway simulation upper bound | `5.0` |
@@ -284,6 +296,8 @@ The e2e suite covers:
 - migration-backed database setup through Alembic
 - parallel requests with the same `Idempotency-Key`
 - real retry flow through RabbitMQ TTL queues and dead-letter routing
+- terminal webhook failures observed in the live RabbitMQ DLQ
+- expired gateway and webhook claims resumed through the live outbox/consumer flow
 - live topology verification against RabbitMQ
 
 ## Make targets
